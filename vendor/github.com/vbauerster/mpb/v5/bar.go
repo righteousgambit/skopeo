@@ -12,10 +12,10 @@ import (
 
 	"github.com/acarl005/stripansi"
 	"github.com/mattn/go-runewidth"
-	"github.com/vbauerster/mpb/v6/decor"
+	"github.com/vbauerster/mpb/v5/decor"
 )
 
-// Bar represents a progress bar.
+// Bar represents a progress Bar.
 type Bar struct {
 	priority int // used by heap
 	index    int // used by heap
@@ -42,10 +42,8 @@ type Bar struct {
 	recoveredPanic interface{}
 }
 
-type extenderFunc func(in io.Reader, reqWidth int, st decor.Statistics) (out io.Reader, lines int)
+type extFunc func(in io.Reader, reqWidth int, st decor.Statistics) (out io.Reader, lines int)
 
-// bState is actual bar state. It gets passed to *Bar.serve(...) monitor
-// goroutine.
 type bState struct {
 	id                int
 	priority          int
@@ -56,9 +54,9 @@ type bState struct {
 	lastN             int64
 	iterated          bool
 	trimSpace         bool
-	completed         bool
+	toComplete        bool
 	completeFlushed   bool
-	triggerComplete   bool
+	ignoreComplete    bool
 	dropOnComplete    bool
 	noPop             bool
 	aDecorators       []decor.Decorator
@@ -69,7 +67,7 @@ type bState struct {
 	bufP, bufB, bufA  *bytes.Buffer
 	filler            BarFiller
 	middleware        func(BarFiller) BarFiller
-	extender          extenderFunc
+	extender          extFunc
 
 	// runningBar is a key for *pState.parkedBars
 	runningBar *Bar
@@ -130,10 +128,9 @@ func (b *Bar) Current() int64 {
 	}
 }
 
-// SetRefill sets refill flag with specified amount.
-// The underlying BarFiller will change its visual representation, to
-// indicate refill event. Refill event may be referred to some retry
-// operation for example.
+// SetRefill fills bar with refill rune up to amount argument.
+// Given default bar style is "[=>-]<+", refill rune is '+'.
+// To set bar style use mpb.BarStyle(string) BarOption.
 func (b *Bar) SetRefill(amount int64) {
 	select {
 	case b.operateState <- func(s *bState) {
@@ -162,18 +159,19 @@ func (b *Bar) TraverseDecorators(cb func(decor.Decorator)) {
 
 // SetTotal sets total dynamically.
 // If total is less than or equal to zero it takes progress' current value.
-func (b *Bar) SetTotal(total int64, triggerComplete bool) {
+// A complete flag enables or disables complete event on `current >= total`.
+func (b *Bar) SetTotal(total int64, complete bool) {
 	select {
 	case b.operateState <- func(s *bState) {
-		s.triggerComplete = triggerComplete
+		s.ignoreComplete = !complete
 		if total <= 0 {
 			s.total = s.current
 		} else {
 			s.total = total
 		}
-		if s.triggerComplete && !s.completed {
+		if !s.ignoreComplete && !s.toComplete {
 			s.current = s.total
-			s.completed = true
+			s.toComplete = true
 			go b.refreshTillShutdown()
 		}
 	}:
@@ -189,9 +187,9 @@ func (b *Bar) SetCurrent(current int64) {
 		s.iterated = true
 		s.lastN = current - s.current
 		s.current = current
-		if s.triggerComplete && s.current >= s.total {
+		if !s.ignoreComplete && s.current >= s.total {
 			s.current = s.total
-			s.completed = true
+			s.toComplete = true
 			go b.refreshTillShutdown()
 		}
 	}:
@@ -216,9 +214,9 @@ func (b *Bar) IncrInt64(n int64) {
 		s.iterated = true
 		s.lastN = n
 		s.current += n
-		if s.triggerComplete && s.current >= s.total {
+		if !s.ignoreComplete && s.current >= s.total {
 			s.current = s.total
-			s.completed = true
+			s.toComplete = true
 			go b.refreshTillShutdown()
 		}
 	}:
@@ -282,7 +280,7 @@ func (b *Bar) Abort(drop bool) {
 // Completed reports whether the bar is in completed state.
 func (b *Bar) Completed() bool {
 	select {
-	case b.operateState <- func(s *bState) { b.completed <- s.completed }:
+	case b.operateState <- func(s *bState) { b.completed <- s.toComplete }:
 		return <-b.completed
 	case <-b.done:
 		return true
@@ -324,11 +322,11 @@ func (b *Bar) render(tw int) {
 				b.frameCh <- frame
 				b.dlogger.Println(p)
 			}
-			s.completeFlushed = s.completed
+			s.completeFlushed = s.toComplete
 		}()
 		frame, lines := s.extender(s.draw(stat), s.reqWidth, stat)
 		b.extendedLines = lines
-		b.toShutdown = s.completed && !s.completeFlushed
+		b.toShutdown = s.toComplete && !s.completeFlushed
 		b.frameCh <- frame
 	}:
 	case <-b.done:
@@ -477,7 +475,7 @@ func ewmaIterationUpdate(done bool, s *bState, dur time.Duration) {
 	}
 }
 
-func makePanicExtender(p interface{}) extenderFunc {
+func makePanicExtender(p interface{}) extFunc {
 	pstr := fmt.Sprint(p)
 	stack := debug.Stack()
 	stackLines := bytes.Count(stack, []byte("\n"))
